@@ -30,6 +30,7 @@ from io import BytesIO
 import json
 import os
 from uuid import UUID, uuid4
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
@@ -83,19 +84,16 @@ conf = ConnectionConfig(
 
 fm = FastMail(conf)
 
-
-class NoBackMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        response = await call_next(request)
-        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
-        response.headers["Pragma"] = "no-cache"
-        response.headers["Expires"] = "0"
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        return response
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3002"],  # Allow only your frontend URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-app.add_middleware(NoBackMiddleware)
+
 
 
 def get_db():
@@ -173,27 +171,24 @@ async def register(request: Request):
 
 
 
-@app.post("/", response_class=JSONResponse)
-async def register_post(
-    request: Request,
-    email: str = Form(...),
-    password: str = Form(...),
-    db: Session = Depends(get_db)
-):
+class UserRegisterRequest(BaseModel):
+    email: str
+    password: str
+
+@app.post("/register", response_class=JSONResponse)
+async def register_post(user: UserRegisterRequest, db: Session = Depends(get_db)):
     try:
-        # Check if user already exists
-        user = db.query(User).filter(User.email == email).first()
-        if user:
+        # Check if the user already exists
+        existing_user = db.query(User).filter(User.email == user.email).first()
+        if existing_user:
             return JSONResponse(content={"success": False, "message": "Email already exists"}, status_code=400)
 
-        # Generate a unique identifier
-        unique_user_id = uuid4()
-
         # Create a new user
+        unique_user_id = uuid4()
         new_user = User(
             id=unique_user_id,
-            email=email,
-            password=password,
+            email=user.email,
+            password=user.password,
             is_restricted=False,
             create_event=True,
             create_form=True
@@ -203,10 +198,10 @@ async def register_post(
         db.refresh(new_user)
 
         return JSONResponse(content={"success": True, "user_id": str(unique_user_id), "message": "Registration successful"}, status_code=201)
+
     except Exception as e:
         db.rollback()
         return JSONResponse(content={"success": False, "message": f"An error occurred: {str(e)}"}, status_code=500)
-
 @app.get("/login", response_class=HTMLResponse)
 async def login(request: Request):
     return templates.TemplateResponse("login.html", {"request": request})
