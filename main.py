@@ -9,10 +9,11 @@ from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 from starlette.middleware.sessions import SessionMiddleware
 from itsdangerous import URLSafeTimedSerializer
 from database import SessionLocal, engine
-from models import User, Event, PendingEvent, EventForm, ImageModel
-from schemas import UserSchema, EventFormCreate, UserDetails, ImageCreate, ImageResponse, ImageBase
+from models import User, Event, EventForm, ImageModel,Date
+from schemas import UserSchema, EventFormCreate, UserDetails, ImageCreate, ImageResponse, ImageBase, EventCreate
 from database import Base
-import smtplib
+from datetime import date
+from schemas import EventStatusEnum
 import base64
 from typing import List, Any, Optional
 from email.mime.text import MIMEText
@@ -31,6 +32,15 @@ import json
 import os
 from uuid import UUID, uuid4
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Form
+from fastapi_jwt_auth import AuthJWT
+from fastapi_jwt_auth.exceptions import AuthJWTException
+from fastapi import FastAPI, Request, Depends, Form
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
+from starlette.responses import JSONResponse
+from sqlalchemy import select
+
 
 app = FastAPI()
 
@@ -86,14 +96,11 @@ fm = FastMail(conf)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3002"],  # Allow only your frontend URL
+    allow_origins=["http://localhost:3001"],  # Allow only your frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-
 
 
 def get_db():
@@ -116,21 +123,6 @@ def get_current_admin(request: Request):
     if not admin:
         raise HTTPException(status_code=HTTP_401_UNAUTHORIZED, detail="Not authenticated")
     return admin
-
-
-def require_login(func):
-    @wraps(func)
-    async def wrapper(request: Request, *args, **kwargs):
-        try:
-            get_current_user(request)
-            if not request.session.get('authenticated'):
-                raise HTTPException(status_code=401, detail="Not authenticated")
-        except HTTPException:
-            return RedirectResponse(url="/login", status_code=303)
-        return await func(request, *args, **kwargs)
-
-    return wrapper
-
 
 def require_admin(func):
     @wraps(func)
@@ -202,9 +194,126 @@ async def register_post(user: UserRegisterRequest, db: Session = Depends(get_db)
     except Exception as e:
         db.rollback()
         return JSONResponse(content={"success": False, "message": f"An error occurred: {str(e)}"}, status_code=500)
+
 @app.get("/login", response_class=HTMLResponse)
 async def login(request: Request):
     return templates.TemplateResponse("login.html", {"request": request})
+
+
+class Settings(BaseModel):
+    authjwt_secret_key: str = "xxxrtoiu897678"
+
+@AuthJWT.load_config
+def get_config():
+    return Settings()
+
+
+# Handle JWT-related errors
+@app.exception_handler(AuthJWTException)
+def authjwt_exception_handler(request, exc):
+    return JSONResponse(status_code=401, content={"message": "Token expired or invalid."})
+
+@app.post("/login", response_class=JSONResponse)
+async def login_post(
+    email: str = Form(...),
+    password: str = Form(...),
+    db: Session = Depends(get_db),
+    Authorize: AuthJWT = Depends()
+):
+    user = db.query(User).filter(User.email == email).first()
+
+    if user and user.password == password and user.is_active:
+        # Generate access token with user ID and permissions in payload
+        access_token = Authorize.create_access_token(subject=str(user.id),
+                                                     user_claims={
+                                                         "permissions": {
+                                                             "create_event": user.create_event,
+                                                             "create_form": user.create_form,
+                                                             "view_registrations": user.view_registrations
+                                                         }
+                                                     })
+       
+        # Return the token and user data
+        return JSONResponse(content={
+            "success": True,
+            "message": "Login successful",
+            "access_token": access_token,
+            "user_id": str(user.id),
+            "user_email": user.email,
+            "permissions": {
+                "create_event": user.create_event,
+                "create_form": user.create_form,
+                "view_registrations": user.view_registrations
+            }
+        })
+    else:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+
+
+
+@app.get("/protected-route")
+def protected_route(Authorize: AuthJWT = Depends()):
+    Authorize.jwt_required()  # Validates the JWT token
+   
+    # Get the user ID from the token
+    current_user_id = Authorize.get_jwt_subject()
+   
+    # Extract permissions from the token claims
+    user_claims = Authorize.get_raw_jwt()
+    permissions = user_claims["permissions"]
+   
+    return {
+        "message": f"Welcome, user {current_user_id}!",
+        "permissions": permissions
+    }
+
+@app.post("/create_event", response_class=JSONResponse)
+async def create_event(
+    event_name: str = Form(...),
+    venue_address: str = Form(...),
+    event_date: date = Form(...),
+    audience: str = Form(...),
+    delegates: str = Form(...),
+    speaker: str = Form(...),
+    nri: str = Form(...),
+    db: Session = Depends(get_db),
+   
+):
+    try:
+        # Validate the JWT token
+
+        # Convert string values to booleans
+        audience = audience.lower() == 'true'
+        delegates = delegates.lower() == 'true'
+        speaker = speaker.lower() == 'true'
+        nri = nri.lower() == 'true'
+
+        # Create the new event
+        new_event = Event(
+            event_name=event_name,
+            venue_address=venue_address,
+            event_date=event_date,
+            audience=audience,
+            delegates=delegates,
+            speaker=speaker,
+            nri=nri,
+             # Add the user_id to the event
+            status=EventStatusEnum.PENDING
+        )
+
+        # Add to the database session and commit
+        db.add(new_event)
+        db.commit()
+        db.refresh(new_event)
+
+        return JSONResponse(content={"success": True, "message": "Event created successfully", "event_id": str(new_event.id)}, status_code=201)
+
+    except Exception as e:
+        # Handle exceptions and return error response
+        db.rollback()  # Rollback if there is an error
+        return JSONResponse(content={"success": False, "message": f"Error creating event: {str(e)}"}, status_code=500)
+
 
 @app.get("/user/{user_id}", response_class=JSONResponse)
 async def get_user_details(
@@ -234,32 +343,32 @@ async def get_user_details(
         return JSONResponse(content={"success": False, "message": f"An error occurred: {str(e)}"}, status_code=500)
 
 
-@app.post("/login", response_class=JSONResponse)
-async def login_post(
-    request: Request,
-    email: str = Form(...),
-    password: str = Form(...),
-    db: Session = Depends(get_db)
-):
+@app.get("/user_events/{user_id}", response_model=List[EventCreate])
+async def get_user_events(user_id: UUID, db: Session = Depends(get_db)):
     try:
-        user = db.query(User).filter(User.email == email).first()
-        if user and user.password == password and user.is_active:
-            # Create the response JSON
-            response_data = {
-                "success": True,
-                "message": "Login successful",
-                "user_id": str(user.id),  # Convert UUID to string
-                "user_email": email,
-                "is_restricted": user.is_restricted,
-                "permissions": {
-                    "create_event": user.create_event,
-                    "create_form": user.create_form,
-                    "view_registrations": user.view_registrations
-                }
-            }
-            return JSONResponse(content=response_data, status_code=200)
-        else:
-            return JSONResponse(content={"success": False, "message": "Invalid credentials"}, status_code=401)
+        # Retrieve all events for the given user
+        user_events = db.query(Event).filter(Event.user_id == user_id).all()
+
+        return [EventCreate.from_orm(event) for event in user_events]
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving user events: {str(e)}")
+
+
+@app.post("/submit_form/{event_id}")
+async def submit_form(event_id: UUID, form_data: dict, db: Session = Depends(get_db)):
+    try:
+        new_form = EventForm(event_id=event_id, form_data=form_data)
+        db.add(new_form)
+        db.commit()
+        db.refresh(new_form)
+        return JSONResponse(content={"success": True, "message": "Form submitted successfully.", "form_id": str(new_form.id)}, status_code=201)
     except Exception as e:
         return JSONResponse(content={"success": False, "message": f"An error occurred: {str(e)}"}, status_code=500)
-    
+
+
+@app.get("/get_forms/{event_id}")
+async def get_forms(event_id: UUID, db: Session = Depends(get_db)):
+    forms = db.query(EventForm).filter(EventForm.event_id == event_id).all()
+    return {"forms": [form.form_data for form in forms]}
+

@@ -1,7 +1,8 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import Optional
 from enum import Enum
 from datetime import date
+from sqlalchemy.dialects.postgresql import JSONB
 
 class EventStatusEnum(str, Enum):
     PENDING = "pending"
@@ -40,6 +41,8 @@ class EventCreate(BaseModel):
     delegates: bool
     speaker: bool
     nri: bool
+    
+    model_config = ConfigDict(from_attributes=True)
 
 class EventResponse(EventCreate):
     id: int
